@@ -1,0 +1,11 @@
+{
+  "name": "koki-develop",
+  "owner": { "name": "koki-develop" },
+  "plugins": [
+    {
+      "name": "tide",
+      "source": "./plugins/tide",
+      "description": "Dark water theme for the desktop Code tab."
+    }
+  ]
+}
