@@ -61,7 +61,6 @@ const { theme, problems } = makeColors({
         'text-secondary': INK.secondary,
         'text-muted': INK.muted,
       },
-      stops: { 550: '#ff3030', 600: '#30ff30', 650: '#3080ff', 700: '#ffe030', 750: '#ff30ff' },
     },
   },
 })
