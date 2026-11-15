@@ -61,9 +61,7 @@ const { theme, problems } = makeColors({
         'text-secondary': INK.secondary,
         'text-muted': INK.muted,
       },
-      // Borders, rings and the translucent fills are this stop at low opacity: dimmer than the
-      // near-white stop the anchors give, so outlines stay quiet over the water.
-      stops: { 0: '#ff3030' },
+      stops: { 550: '#ff3030', 600: '#30ff30', 650: '#3080ff', 700: '#ffe030', 750: '#ff30ff' },
     },
   },
 })
