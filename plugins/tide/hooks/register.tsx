@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionContextBreakdown, Timer } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { Meter, Water } from '../types'
 
@@ -35,6 +35,18 @@ function cancelSettle(): void {
   settle = undefined
 }
 
+/** How often, and how many times, the water looks for a swapped-out window to land. */
+const SWAP_POLL_MS = 100
+const SWAP_POLLS = 20
+
+/** The wait for a compaction or a clear to land; a reload drops it. */
+let swap: Timer | undefined
+
+function cancelSwap(): void {
+  swap?.cancel()
+  swap = undefined
+}
+
 function logFailure($: Engine, what: string, error: unknown): void {
   $.ui.log(`tide: ${what} failed: ${error instanceof Error ? error.message : String(error)}`, { to: 'debug' })
 }
@@ -55,10 +67,12 @@ function isSame(a: unknown, b: unknown): boolean {
 async function refreshMeter($: Engine): Promise<Meter | undefined> {
   try {
     const usage = await $.session.usage()
-    let estimate: SessionContextBreakdown | undefined
-    if (needsEstimate(usage)) estimate = (await $.session.usage({ breakdown: 'summary' })).context.breakdown
+    let estimatedTokens: number | undefined
+    if (needsEstimate(usage)) {
+      estimatedTokens = (await $.session.usage({ breakdown: 'summary' })).context.breakdown?.totalTokens
+    }
 
-    const meter = meterOf(usage, estimate)
+    const meter = meterOf(usage, estimatedTokens)
     if (!isSame(await read($, meterAtom), meter)) await update($, meterAtom, () => meter)
     return meter
   } catch (error) {
@@ -79,6 +93,45 @@ async function setWater($: Engine, level: number | undefined, phase?: Water['pha
   }))
 }
 
+/**
+ * What identifies the context window as it stands: its last measure and the local estimate.
+ * `undefined` when it cannot be read.
+ */
+async function windowMark($: Engine): Promise<string | undefined> {
+  try {
+    const { context } = await $.session.usage({ breakdown: 'summary' })
+    return JSON.stringify([context.tokens ?? null, context.breakdown?.totalTokens ?? null])
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The engine swaps the context window out (a compaction, a /clear) only once that event's hooks
+ * have returned, so a reading taken inside them still measures the old window. From right after the
+ * hook returns, the band and the water wait for the window's mark to leave `stale`, the mark taken
+ * inside the hook, then follow the new window.
+ */
+function followSwap($: Engine, stale: string | undefined): void {
+  cancelSwap()
+  waitForSwap($, stale, 0)
+}
+
+function waitForSwap($: Engine, stale: string | undefined, attempt: number): void {
+  swap = $.clock.after(attempt === 0 ? 0 : SWAP_POLL_MS, () => void landSwap($, stale, attempt))
+}
+
+async function landSwap($: Engine, stale: string | undefined, attempt: number): Promise<void> {
+  swap = undefined
+  const mark = stale === undefined ? undefined : await windowMark($)
+  if (mark !== undefined && mark === stale) {
+    if (attempt + 1 < SWAP_POLLS) return waitForSwap($, stale, attempt + 1)
+    $.ui.log('tide: the context window did not change after it was swapped out', { to: 'debug' })
+    return
+  }
+  await setWater($, levelOf(await refreshMeter($)))
+}
+
 async function settleWater($: Engine): Promise<void> {
   await update($, waterAtom, (water): Water => (water.phase === 'done' ? { ...water, from: water.level, phase: 'idle' } : water))
 }
@@ -87,6 +140,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     cancelSettle()
+    cancelSwap()
 
     if (UNPAINTED !== undefined) $.ui.toast(`tide: ${UNPAINTED}`)
     try {
@@ -137,20 +191,27 @@ export const register: Register = on => {
   }).catch((_, e, next) => next(e))
 
   on('session.compact', async ($, e, next) => {
-    const compacted = await next(e)
-    // A subagent's compaction, a precomputation nobody applied yet, and a vetoed one leave the window as it is.
-    if (e.agentId !== undefined || e.trigger === 'precompute' || 'skip' in compacted) return compacted
+    // A subagent's compaction and a precomputation nobody applied yet leave the window as it is.
+    if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
 
-    await setWater($, levelOf(await refreshMeter($)))
+    const stale = await windowMark($)
+    const compacted = await next(e)
+    if (!('skip' in compacted)) followSwap($, stale)
 
     return compacted
   }).catch((_, e, next) => next(e))
 
   on('session.end', async ($, e, next) => {
+    const stale = e.reason === 'clear' ? await windowMark($) : undefined
     const ended = await next(e)
     cancelSettle()
+    cancelSwap()
 
-    if (e.reason === 'clear') await setWater($, levelOf(await refreshMeter($)), 'idle')
+    // A /clear goes on in a new window, with no new session.start.
+    if (e.reason === 'clear') {
+      await setWater($, undefined, 'idle')
+      followSwap($, stale)
+    }
 
     return ended
   })

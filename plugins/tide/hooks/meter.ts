@@ -1,4 +1,4 @@
-import type { SessionContextBreakdown, SessionUsage } from 'claude-code'
+import type { SessionUsage } from 'claude-code'
 
 import type { Meter } from '../types'
 
@@ -8,28 +8,24 @@ export const EMPTY_METER: Meter = { context: null, weekly: null, costUsd: null }
 
 /**
  * The band's figures from `$.session.usage()`. Where the session has no measured context (no
- * response since it started or compacted), `estimate`, a `breakdown: 'summary'` reading, stands in,
- * against the same window so the figure stays comparable with a measured one.
+ * response since it started or compacted), `estimatedTokens` stands in, against the same window so
+ * the figure stays comparable with a measured one.
  */
-export function meterOf(usage: SessionUsage, estimate?: SessionContextBreakdown): Meter {
+export function meterOf(usage: SessionUsage, estimatedTokens?: number): Meter {
   const { context } = usage
   const weekly = usage.rateLimits.find(limit => limit.kind === 'seven_day')
 
   return {
-    context: contextOf(context.percent, context.window, estimate),
+    context: contextOf(context.percent, context.window, estimatedTokens),
     weekly: weekly === undefined ? null : { percent: weekly.percentUsed, resetsAt: weekly.resetsAt ?? null },
     costUsd: usage.cost?.usd ?? null,
   }
 }
 
-function contextOf(
-  percent: number | undefined,
-  window: number,
-  estimate: SessionContextBreakdown | undefined,
-): Meter['context'] {
+function contextOf(percent: number | undefined, window: number, estimatedTokens: number | undefined): Meter['context'] {
   if (percent !== undefined) return { percent, isEstimate: false }
-  if (estimate === undefined || window <= 0) return null
-  return { percent: Math.round((estimate.totalTokens / window) * 100), isEstimate: true }
+  if (estimatedTokens === undefined || window <= 0) return null
+  return { percent: Math.round((estimatedTokens / window) * 100), isEstimate: true }
 }
 
 /** Whether a reading needs the local estimate to stand in for a missing measure. */

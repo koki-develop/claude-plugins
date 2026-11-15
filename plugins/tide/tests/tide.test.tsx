@@ -70,12 +70,19 @@ function engine(on: On, world: World) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('tool.call', () => ({ result: {} }))
 
   return { themes, statuses, writes, clock, water: () => state.water, meter: () => state.meter }
 }
 
 const measured = (percent: number): World => ({ percent, estimateTokens: percent * (WINDOW / 100), fails: false })
+
+/** The engine swapping the window out: no response has measured the new one, only the estimate. */
+function landWindow(world: World, estimateTokens: number): void {
+  world.percent = undefined
+  world.estimateTokens = estimateTokens
+}
 
 const BAND = {
   plugin: 'tide',
@@ -174,10 +181,10 @@ describe('meter', () => {
 
   test('an estimate stands in only where nothing is measured', async () => {
     const measuredUsage = usageOf(measured(46), true)
-    expect(meterOf(measuredUsage, measuredUsage.context.breakdown).context).toEqual({ percent: 46, isEstimate: false })
+    expect(meterOf(measuredUsage, 36000).context).toEqual({ percent: 46, isEstimate: false })
 
     const fresh = usageOf({ percent: undefined, estimateTokens: 36000, fails: false }, true)
-    expect(meterOf(fresh, fresh.context.breakdown).context).toEqual({ percent: 18, isEstimate: true })
+    expect(meterOf(fresh, 36000).context).toEqual({ percent: 18, isEstimate: true })
     expect(meterOf(fresh).context).toBe(null)
   })
 })
@@ -317,35 +324,85 @@ describe('session', () => {
     await ui.unmount()
   })
 
-  test('compaction lowers the water to the estimate until a response measures it', async ($, on) => {
+  test('compaction moves the water only once the engine has swapped the window out', async ($, on) => {
     const world = measured(88)
-    const { water, meter } = engine(on, world)
-    let skip: string | undefined
+    const { water, meter, clock } = engine(on, world)
+    on('session.compact', () => ({ messages: SUMMARY }))
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+    // The hooks run while the old window still stands; it is swapped out once they returned.
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    expect(water()?.level).toBe(88)
+    landWindow(world, 36000)
+    await clock.advance(0)
+
+    expect(water()).toEqual({ level: 18, from: 88, phase: 'idle' })
+    expect(meter()?.context).toEqual({ percent: 18, isEstimate: true })
+  })
+
+  test('a window swapped out late is waited for, and one that never changes is let go', async ($, on) => {
+    const world = measured(88)
+    const { water, clock } = engine(on, world)
+    on('session.compact', () => ({ messages: SUMMARY }))
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    await clock.advance(250)
+    expect(water()?.level).toBe(88)
+    landWindow(world, 36000)
+    await clock.advance(100)
+    expect(water()?.level).toBe(18)
+
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    await clock.advance(5000)
+    landWindow(world, 10000)
+    await clock.advance(5000)
+    expect(water()?.level).toBe(18)
+  })
+
+  test('a vetoed compaction, a precomputation and a subagent compaction leave the water', async ($, on) => {
+    const world = measured(88)
+    const { water, clock } = engine(on, world)
+    let skip: string | undefined = 'blocked'
     on('session.compact', () => (skip === undefined ? { messages: SUMMARY } : { skip }))
     await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 
-    world.percent = undefined
-    world.estimateTokens = 36000
     await $.session.compact({ trigger: 'manual', messages: SUMMARY })
-    expect(water()).toEqual({ level: 18, from: 88, phase: 'idle' })
-    expect(meter()?.context?.isEstimate).toBe(true)
-
-    world.estimateTokens = 10000
-    skip = 'blocked'
-    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    skip = undefined
     await $.session.compact({ trigger: 'precompute', messages: SUMMARY })
-    expect(water()?.level).toBe(18)
+    await $.session.compact({ trigger: 'auto', messages: SUMMARY, agentId: 'agent-1' })
+    landWindow(world, 36000)
+    await clock.advance(5000)
+
+    expect(water()?.level).toBe(88)
+  })
+
+  test('a clear settles the water and follows the new window', async ($, on) => {
+    const world = measured(70)
+    const { water, clock } = engine(on, world)
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await $.turn.complete(ANSWERED)
+    expect(water()?.phase).toBe('done')
+
+    await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+    expect(water()).toEqual({ level: 70, from: 70, phase: 'idle' })
+    landWindow(world, 20000)
+    await clock.advance(0)
+
+    expect(water()).toEqual({ level: 10, from: 70, phase: 'idle' })
   })
 
   test('with nothing measured or estimated the water stays where it stood', async ($, on) => {
     const world = measured(64)
-    const { water } = engine(on, world)
+    const { water, clock } = engine(on, world)
     on('session.compact', () => ({ messages: SUMMARY }))
     await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 
+    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
     world.percent = undefined
     world.estimateTokens = undefined
-    await $.session.compact({ trigger: 'manual', messages: SUMMARY })
+    await clock.advance(0)
     expect(water()?.level).toBe(64)
 
     const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
