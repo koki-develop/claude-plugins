@@ -1,6 +1,5 @@
 {
   "name": "tide",
-  "version": "0.1.0",
   "description": "Dark water theme for the desktop Code tab.",
   "types": "./types/index.d.ts"
 }
